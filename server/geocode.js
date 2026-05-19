@@ -71,10 +71,16 @@ export async function reverseGeocode(lat, lon) {
   url.searchParams.set('accept-language', 'pt-BR');
   url.searchParams.set('zoom', '18');
 
+  const contact = process.env.NOMINATIM_CONTACT;
+  if (!contact) {
+    console.warn('[geocode] NOMINATIM_CONTACT não definido no .env — Nominatim pode bloquear o pedido');
+  }
+  const userAgent = `teste-rastreador/1.0 (${contact || 'contato@example.com'})`;
+
   try {
     const res = await throttledFetch(url.toString(), {
       headers: {
-        'User-Agent': 'teste-rastreador/1.0 (contato@example.com)',
+        'User-Agent': userAgent,
       },
     });
     if (!res.ok) {
