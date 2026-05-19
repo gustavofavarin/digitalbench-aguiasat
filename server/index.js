@@ -12,12 +12,14 @@ import {
   hasCredentials as hasDoCredentials,
 } from './dotelematics.js';
 import { reverseGeocode } from './geocode.js';
+import { detectText } from './vision.js';
 
 const app = express();
 const PORT = Number(process.env.PORT) || 3001;
 const GEOCODE_CONCURRENCY = 1;
 
-app.use(express.json());
+// 10MB cobre imagens base64 (resize no cliente já limita a ~1.5MB).
+app.use(express.json({ limit: '10mb' }));
 
 function parseTimestamp(raw) {
   if (!raw) return null;
@@ -68,6 +70,20 @@ function normalizeRaw(v, fonte) {
     fonte,
   };
 }
+
+app.post('/api/ocr', async (req, res) => {
+  const { image } = req.body ?? {};
+  if (!image || typeof image !== 'string') {
+    return res.status(400).json({ error: 'Campo "image" (base64) é obrigatório.' });
+  }
+  try {
+    const text = await detectText(image);
+    res.json({ text });
+  } catch (err) {
+    console.error('[/api/ocr] falhou:', err);
+    res.status(502).json({ error: err.message ?? 'Falha no OCR.' });
+  }
+});
 
 app.get('/api/health', (_req, res) => {
   res.json({

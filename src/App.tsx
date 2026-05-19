@@ -1,6 +1,8 @@
 import { useEffect, useRef, useState } from 'react'
 import './App.css'
 import logoUrl from './assets/logo.png'
+import { ImeiCapture } from './components/ImeiCapture'
+import { readImei, type ImeiReadResult } from './lib/imeiReader'
 
 type Result = {
   id: string | null
@@ -62,8 +64,94 @@ function App() {
   const [data, setData] = useState<SearchResponse | null>(null)
   const [searched, setSearched] = useState(false)
   const [copiedKey, setCopiedKey] = useState<string | null>(null)
+  const [imagePreview, setImagePreview] = useState<string | null>(null)
+  const [readingImage, setReadingImage] = useState(false)
+  const [imeiResult, setImeiResult] = useState<ImeiReadResult | null>(null)
+  const [dragOver, setDragOver] = useState(false)
   const abortRef = useRef<AbortController | null>(null)
   const inputRef = useRef<HTMLInputElement>(null)
+  const fileInputRef = useRef<HTMLInputElement>(null)
+
+  function clearImage() {
+    setImagePreview((prev) => {
+      if (prev) URL.revokeObjectURL(prev)
+      return null
+    })
+    setImeiResult(null)
+    setReadingImage(false)
+    if (fileInputRef.current) fileInputRef.current.value = ''
+  }
+
+  async function handleImageFile(file: File) {
+    if (!file.type.startsWith('image/')) return
+    if (imagePreview) URL.revokeObjectURL(imagePreview)
+    const url = URL.createObjectURL(file)
+    setImagePreview(url)
+    setImeiResult(null)
+    setReadingImage(true)
+    try {
+      const result = await readImei(file)
+      setImeiResult(result)
+      if (result.ok) {
+        setQuery(result.value)
+        // Quando a leitura é completa (15 dígitos + Luhn, sem aviso), busca já.
+        // Com aviso, deixa o técnico conferir/completar antes.
+        if (!result.warning) {
+          void performSearch(result.value)
+        } else {
+          inputRef.current?.focus()
+        }
+      }
+    } catch (err) {
+      setImeiResult({
+        ok: false,
+        error: (err as Error).message || 'Falha ao processar a imagem.',
+      })
+    } finally {
+      setReadingImage(false)
+    }
+  }
+
+  function onInputPaste(e: React.ClipboardEvent<HTMLInputElement>) {
+    const files = e.clipboardData?.files
+    if (!files || files.length === 0) return
+    const image = Array.from(files).find((f) => f.type.startsWith('image/'))
+    if (!image) return
+    e.preventDefault()
+    void handleImageFile(image)
+  }
+
+  function onDragOver(e: React.DragEvent) {
+    if (!e.dataTransfer?.types?.includes('Files')) return
+    e.preventDefault()
+    setDragOver(true)
+  }
+
+  function onDragLeave(e: React.DragEvent) {
+    if (e.currentTarget.contains(e.relatedTarget as Node)) return
+    setDragOver(false)
+  }
+
+  function onDrop(e: React.DragEvent) {
+    setDragOver(false)
+    const files = e.dataTransfer?.files
+    if (!files || files.length === 0) return
+    const image = Array.from(files).find((f) => f.type.startsWith('image/'))
+    if (!image) return
+    e.preventDefault()
+    void handleImageFile(image)
+  }
+
+  function onFilePicked(e: React.ChangeEvent<HTMLInputElement>) {
+    const file = e.target.files?.[0]
+    if (file) void handleImageFile(file)
+  }
+
+  useEffect(() => {
+    return () => {
+      if (imagePreview) URL.revokeObjectURL(imagePreview)
+    }
+  }, [imagePreview])
 
   async function copyCard(key: string, r: Result) {
     try {
@@ -81,9 +169,8 @@ function App() {
     inputRef.current?.focus()
   }, [])
 
-  async function runSearch(e?: React.FormEvent) {
-    e?.preventDefault()
-    const q = query.trim()
+  async function performSearch(rawQuery: string) {
+    const q = rawQuery.trim()
     if (!q) return
 
     abortRef.current?.abort()
@@ -124,21 +211,56 @@ function App() {
         <img src={logoUrl} alt="ÁguiaSat" className="hero-logo" />
       </header>
 
-      <form className="search" onSubmit={runSearch}>
+      <form
+        className={`search${dragOver ? ' drag-over' : ''}`}
+        onSubmit={(e) => {
+          e.preventDefault()
+          void performSearch(query)
+        }}
+        onDragOver={onDragOver}
+        onDragLeave={onDragLeave}
+        onDrop={onDrop}
+      >
         <input
           ref={inputRef}
           type="text"
           inputMode="numeric"
-          placeholder="Digite o ID"
+          placeholder="Digite o ID ou cole/arraste uma foto"
           value={query}
           onChange={(e) => setQuery(e.target.value)}
+          onPaste={onInputPaste}
           autoComplete="off"
           disabled={loading}
+        />
+        <button
+          type="button"
+          className="camera-btn"
+          onClick={() => fileInputRef.current?.click()}
+          disabled={loading || readingImage}
+          aria-label="Ler etiqueta por imagem"
+          title="Ler etiqueta por imagem"
+        >
+          📷
+        </button>
+        <input
+          ref={fileInputRef}
+          type="file"
+          accept="image/*"
+          capture="environment"
+          onChange={onFilePicked}
+          hidden
         />
         <button type="submit" disabled={loading || !query.trim()}>
           {loading ? 'Buscando…' : 'Buscar'}
         </button>
       </form>
+
+      <ImeiCapture
+        previewUrl={imagePreview}
+        reading={readingImage}
+        result={imeiResult}
+        onClear={clearImage}
+      />
 
       {error && <div className="alert error">{error}</div>}
 

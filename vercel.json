@@ -6,6 +6,9 @@
     },
     "api/health.js": {
       "maxDuration": 10
+    },
+    "api/ocr.js": {
+      "maxDuration": 30
     }
   }
 }

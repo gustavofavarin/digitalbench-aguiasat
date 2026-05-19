@@ -25,6 +25,53 @@ são imediatas.
 O reverse geocoding usa o [Nominatim](https://nominatim.openstreetmap.org/)
 (OSM) com cache em memória dos resultados.
 
+## Leitura de etiqueta por imagem
+
+Para evitar digitar IMEI à mão a partir de uma foto recebida pelo
+WhatsApp, o campo de busca aceita imagem por três caminhos:
+
+- **Colar** uma imagem direto no campo (Ctrl+V / Cmd+V).
+- **Arrastar e soltar** a foto sobre a barra de busca.
+- Botão **📷** ao lado do campo (no celular abre a câmera traseira).
+
+O OCR usa a **Google Cloud Vision API** (TEXT_DETECTION). A imagem é
+redimensionada no browser (≤ 1600px, JPEG quality 0.85), enviada por
+`POST /api/ocr` ao backend (Express em dev, Vercel Function em prod),
+que repassa para a Vision com a `GOOGLE_VISION_API_KEY` configurada
+no ambiente. O texto retornado é processado no cliente: ancora na
+palavra "IMEI"/"UIN" da etiqueta, valida o IMEI com Luhn e preenche o
+campo. Quando o IMEI bate completo (15 dígitos + Luhn), dispara
+auto-busca em 3s. Leituras incompletas ou com aviso ficam aguardando
+confirmação manual.
+
+### Configuração da Vision API
+
+1. Criar/entrar num projeto em https://console.cloud.google.com
+2. Ativar **Cloud Vision API**
+3. APIs & Services → Credentials → **Create API key**
+4. Restringir a key:
+   - **API restrictions**: apenas "Cloud Vision API"
+   - **Application restrictions**: **None** — a chave é usada
+     server-side (Express / Vercel Function), nunca chega ao browser.
+     Restrições por HTTP referrer só funcionam pra chaves chamadas do
+     browser e bloqueariam suas próprias chamadas legítimas.
+5. Adicionar `GOOGLE_VISION_API_KEY` ao `.env` (dev) e Environment
+   Variables do Vercel (prod, marcar **Sensitive**)
+6. Configurar **Budget alert** em Billing → Budgets & alerts (ex:
+   R$ 20/mês) — proteção extra contra surpresa.
+
+**Custo**: 1.000 leituras/mês são grátis. Acima disso, US$ 1,50 por
+1.000 imagens. Configure alertas de orçamento no GCP para evitar
+surpresa.
+
+### Dicas para uma foto que lê de primeira
+
+- Aproxime a câmera o suficiente pra etiqueta preencher boa parte do
+  quadro.
+- Se possível, retire o plástico transparente que cobre a etiqueta —
+  ele reflete e atrapalha o OCR.
+- Iluminação difusa funciona melhor do que flash direto.
+
 ## Setup
 
 ```bash
@@ -97,12 +144,17 @@ reaproveitados como bibliotecas pelas functions. O Express em
 
 ## Variáveis de ambiente (`.env`)
 
-| Variável          | Descrição                                    |
-| ----------------- | -------------------------------------------- |
-| `GETRAK_API_KEY`  | Chave (Basic, base64) fornecida pela Getrak  |
-| `GETRAK_USERNAME` | Usuário do fluxo OAuth password              |
-| `GETRAK_PASSWORD` | Senha do fluxo OAuth password                |
-| `PORT`            | Porta do backend (padrão 3001)               |
+| Variável                | Descrição                                         |
+| ----------------------- | ------------------------------------------------- |
+| `GETRAK_API_KEY`        | Chave (Basic, base64) fornecida pela Getrak       |
+| `GETRAK_USERNAME`       | Usuário do fluxo OAuth password                   |
+| `GETRAK_PASSWORD`       | Senha do fluxo OAuth password                     |
+| `DOTELEMATICS_APIKEY`   | API key da DO Telematics                          |
+| `DOTELEMATICS_USERNAME` | Login (email) DO Telematics                       |
+| `DOTELEMATICS_PASSWORD` | Senha DO Telematics                               |
+| `NOMINATIM_CONTACT`     | Email/URL para User-Agent do Nominatim            |
+| `GOOGLE_VISION_API_KEY` | Chave da Google Cloud Vision (leitura por imagem) |
+| `PORT`                  | Porta do backend dev (padrão 3001)                |
 
 ## API
 
@@ -148,15 +200,21 @@ Use `?force=1` para forçar refresh do snapshot.
 api/             Vercel Functions (produção em serverless)
   health.js
   search.js
+  ocr.js
 server/          Express (dev local) + bibliotecas compartilhadas
-  index.js       Express + /api/search + /api/health
+  index.js       Express + /api/search + /api/health + /api/ocr
   getrak.js     OAuth + snapshot cache + busca em memória
   dotelematics.js OAuth + realtime cache + busca
   geocode.js    Nominatim + cache (disco em dev, memória em serverless)
+  vision.js     Cliente Google Cloud Vision (TEXT_DETECTION)
 src/
   App.tsx       Tela única
   App.css
   index.css
   main.tsx
+  components/
+    ImeiCapture.tsx
+  lib/
+    imeiReader.ts  Resize + chamada /api/ocr + extração com âncora
 vercel.json     Config das functions (maxDuration)
 ```
