@@ -240,7 +240,21 @@ function App() {
           aria-label="Ler etiqueta por imagem"
           title="Ler etiqueta por imagem"
         >
-          📷
+          <svg
+            width="22"
+            height="22"
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="#c1373c"
+            strokeWidth="2"
+            strokeLinecap="round"
+            strokeLinejoin="round"
+            aria-hidden="true"
+          >
+            <path d="M14.5 4h-5L7 7H4a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2V9a2 2 0 0 0-2-2h-3l-2.5-3z" />
+            <circle cx="12" cy="13" r="3.5" />
+            <circle cx="18" cy="9" r="0.5" fill="#c1373c" stroke="none" />
+          </svg>
         </button>
         <input
           ref={fileInputRef}
@@ -367,7 +381,12 @@ function App() {
         </ul>
       )}
 
-      {loading && <div className="loading">Consultando Getrak e DO Telematics…</div>}
+      {loading && (
+        <div className="loading">
+          <span className="spinner" aria-hidden="true" />
+          Buscando na base de dados...
+        </div>
+      )}
 
       {!loading && !error && !data && searched === false && (
         <p className="hint">Digite o ID/IMEI (ou os últimos dígitos) e clique em Buscar.</p>

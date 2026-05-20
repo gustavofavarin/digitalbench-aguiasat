@@ -14,7 +14,7 @@ export function ImeiCapture({ previewUrl, reading, result, onClear }: Props) {
     <div className="imei-capture">
       <img src={previewUrl} alt="Etiqueta" className="imei-thumb" />
       <div className="imei-info">
-        {reading && <div className="imei-status">lendo etiqueta…</div>}
+        {reading && <div className="imei-status">Lendo etiqueta…</div>}
 
         {!reading && result?.ok && (
           <>

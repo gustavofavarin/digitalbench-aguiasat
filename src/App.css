@@ -68,12 +68,13 @@
 
 .search .camera-btn {
   padding: 0 14px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
   border: 1px solid #d1d5db;
   border-radius: 10px;
   background: #fff;
   color: #374151;
-  font-size: 18px;
-  font-weight: 400;
   line-height: 1;
   transition: background 0.15s, border-color 0.15s;
   -webkit-tap-highlight-color: transparent;
@@ -400,10 +401,29 @@
 }
 
 .loading {
-  text-align: center;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
   color: #6b7280;
   padding: 24px 0;
   font-size: 14px;
+}
+
+.spinner {
+  width: 16px;
+  height: 16px;
+  border: 2px solid rgba(193, 55, 60, 0.2);
+  border-top-color: #c1373c;
+  border-radius: 50%;
+  animation: spinner-rotate 0.8s linear infinite;
+  flex-shrink: 0;
+}
+
+@keyframes spinner-rotate {
+  to {
+    transform: rotate(360deg);
+  }
 }
 
 .hint {
@@ -425,7 +445,6 @@
   .search .camera-btn {
     flex: 0 0 auto;
     padding: 12px 22px;
-    font-size: 20px;
   }
   .search button[type='submit'] {
     flex: 1 1 0;
