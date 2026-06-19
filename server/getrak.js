@@ -96,6 +96,20 @@ async function fetchLocationsPage(page) {
   };
 }
 
+// Consulta ao vivo um único veículo no provedor (filtro ?id=). Rápida e barata
+// — é o que confirma, na hora da busca, se há posição mais nova que o snapshot.
+async function fetchLocationsById(id) {
+  const url = new URL(LOCATIONS_URL);
+  url.searchParams.set('id', String(id));
+  const res = await authedFetch(url.toString());
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(`Falha na consulta ao vivo Getrak id=${id} (${res.status}): ${text}`);
+  }
+  const data = await res.json();
+  return Array.isArray(data?.veiculos) ? data.veiculos : [];
+}
+
 // Mantém só os campos usados pela busca e pela normalização (shared.js).
 // O payload cru do Getrak é grande demais para guardar 10k+ registros no Redis.
 function trimVeiculo(v) {
@@ -225,6 +239,15 @@ export async function searchVehicles(query, { force = false, waitUntil } = {}) {
   });
 
   return { results, updatedAt: snapshot.updatedAt };
+}
+
+// Consulta ao vivo os veículos cujos id_veiculo o cache já resolveu. Não toca
+// no snapshot — é só o "confirmador" pontual chamado após a busca no cache.
+export async function liveByIds(ids) {
+  const unique = [...new Set((ids || []).filter((x) => x != null && x !== ''))];
+  if (!unique.length) return [];
+  const lists = await Promise.all(unique.map((id) => fetchLocationsById(id)));
+  return lists.flat().map(trimVeiculo);
 }
 
 export function getSnapshotInfo() {

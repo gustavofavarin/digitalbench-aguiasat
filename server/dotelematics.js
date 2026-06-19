@@ -133,6 +133,19 @@ async function fetchRealtime() {
   return Array.isArray(json) ? json : [];
 }
 
+// Consulta ao vivo um único device pelo did (filtro ?did=). É a confirmação
+// pontual chamada após a busca no cache — não reconstrói o snapshot.
+async function fetchRealtimeByDid(did) {
+  const res = await authedGet(`/tracking/realtime/v2?did=${encodeURIComponent(did)}`);
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(`Falha na consulta ao vivo DO did=${did} (${res.status}): ${text}`);
+  }
+  const json = await res.json();
+  if (Array.isArray(json)) return json;
+  return json ? [json] : [];
+}
+
 // Reconstrói a partir do provedor (operação cara) e grava no Redis. É o que o
 // cron roda em background — nunca o usuário.
 async function rebuildSnapshot() {
@@ -244,6 +257,16 @@ export async function searchVehicles(query, { force = false, waitUntil } = {}) {
   });
 
   return { results, updatedAt: snapshot.updatedAt };
+}
+
+// Consulta ao vivo os devices (dids) que a busca no cache encontrou. O did é o
+// próprio modulo/IMEI, então não precisa de ponte como na Getrak.
+export async function liveByDids(dids) {
+  if (!hasCredentials()) throw new Error('Credenciais DO Telematics ausentes');
+  const unique = [...new Set((dids || []).map((x) => String(x ?? '').trim()).filter(Boolean))];
+  if (!unique.length) return [];
+  const lists = await Promise.all(unique.map((did) => fetchRealtimeByDid(did)));
+  return lists.flat().map(mapDocToGetrakLike);
 }
 
 export function getSnapshotInfo() {

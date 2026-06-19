@@ -182,6 +182,61 @@ function App() {
     inputRef.current?.focus()
   }, [])
 
+  async function refreshLive(results: Result[], signal: AbortSignal) {
+    const devices = results
+      .filter(
+        (r) =>
+          (r.fonte === 'Getrak' && r.idVeiculo != null) ||
+          (r.fonte === 'DO Telematics' && r.modulo),
+      )
+      .map((r) => ({ fonte: r.fonte, idVeiculo: r.idVeiculo, modulo: r.modulo }))
+    if (!devices.length) return
+
+    try {
+      const res = await fetch('/api/live', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ devices }),
+        signal,
+      })
+      if (!res.ok) return
+      const json = (await res.json()) as { results?: Result[] }
+      const live = json.results
+      if (!live?.length) return
+
+      const liveByKey = new Map(
+        live.map((lr) => [`${lr.fonte}-${lr.idVeiculo}-${lr.modulo}`, lr] as const),
+      )
+
+      setData((prev) => {
+        if (!prev) return prev
+        let changed = false
+        let newest = prev.snapshotUpdatedAt ? new Date(prev.snapshotUpdatedAt).getTime() : 0
+        const updated = prev.results.map((r) => {
+          const lr = liveByKey.get(`${r.fonte}-${r.idVeiculo}-${r.modulo}`)
+          if (!lr) return r
+          const tPrev = r.ultimaAtualizacao ? new Date(r.ultimaAtualizacao).getTime() : 0
+          const tLive = lr.ultimaAtualizacao ? new Date(lr.ultimaAtualizacao).getTime() : 0
+          // Só troca se o ao-vivo for mais novo — evita regredir ou piscar.
+          if (tLive > tPrev) {
+            changed = true
+            if (tLive > newest) newest = tLive
+            return lr
+          }
+          return r
+        })
+        if (!changed) return prev
+        return {
+          ...prev,
+          results: updated,
+          snapshotUpdatedAt: newest ? new Date(newest).toISOString() : prev.snapshotUpdatedAt,
+        }
+      })
+    } catch {
+      // Silencioso: a confirmação ao vivo é um extra; mantém o dado do cache.
+    }
+  }
+
   async function performSearch(rawQuery: string) {
     const q = rawQuery.trim()
     if (!q) return
@@ -203,7 +258,12 @@ function App() {
         setError(json.error || `Erro ${res.status}`)
         setData(null)
       } else {
-        setData(json as SearchResponse)
+        const search = json as SearchResponse
+        setData(search)
+        // Mostra já o cache (até ~4 min de atraso) e, em paralelo, confirma ao
+        // vivo cada equipamento. Se vier posição mais nova, o card se atualiza
+        // sozinho. Reusa o signal da busca: uma nova busca cancela esta.
+        void refreshLive(search.results, ctrl.signal)
       }
     } catch (err) {
       if ((err as Error).name === 'AbortError') return
