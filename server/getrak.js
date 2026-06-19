@@ -3,17 +3,21 @@ import { readJson, writeJson, hasStore } from './store.js';
 const TOKEN_URL = 'https://api.getrak.com/newkoauth/oauth/token';
 const LOCATIONS_URL = 'https://api.getrak.com/v0.1/localizacoes';
 const PER_PAGE = 500;
-const SNAPSHOT_TTL_MS = 5 * 60 * 1000;
-// Com que frequência uma instância quente reler o Redis pra adotar o snapshot
-// que o cron acabou de gravar. Tem que ser BEM menor que o intervalo do cron,
-// senão a instância serve a foto velha da memória por muito tempo. NÃO usar
-// SNAPSHOT_TTL_MS pra isso: aquele TTL é só pra decidir reconstruir do provedor.
-const STORE_REVALIDATE_MS = 20 * 1000;
-const STORE_KEY = 'snapshot:getrak';
-// O snapshot fica no Redis com TTL maior que o do cron; assim, se o cron
-// falhar por um ciclo, a busca ainda encontra dados (stale) em vez de ter
-// que reconstruir do provedor no caminho do usuário.
-const STORE_TTL_SECONDS = 30 * 60;
+// Quantos equipamentos resolvemos ao vivo por busca. Como toda busca agora vai
+// direto ao provedor (sem snapshot de posições), isto limita o fan-out de
+// chamadas quando a busca é parcial e casa com muitos equipamentos.
+const MAX_LIVE = 50;
+// O índice (modulo → placa → id_veiculo) muda raríssimo: só quando instalam ou
+// trocam um rastreador. O cron reconstrói 1x/hora; este TTL é só a rede de
+// segurança para reconstruir sob demanda caso o cron falhe por horas.
+const INDEX_TTL_MS = 90 * 60 * 1000;
+// Com que frequência uma instância quente relê o Redis pra adotar o índice novo
+// que o cron gravou. O índice muda devagar, então alguns minutos bastam.
+const STORE_REVALIDATE_MS = 5 * 60 * 1000;
+const STORE_KEY = 'index:getrak';
+// TTL no Redis maior que o intervalo do cron: se o cron falhar por um ciclo, a
+// busca ainda encontra o índice (stale) em vez de reconstruir no caminho do usuário.
+const STORE_TTL_SECONDS = 3 * 60 * 60;
 
 let tokenCache = null;
 let snapshot = { veiculos: [], updatedAt: 0 };
@@ -110,8 +114,8 @@ async function fetchLocationsById(id) {
   return Array.isArray(data?.veiculos) ? data.veiculos : [];
 }
 
-// Mantém só os campos usados pela busca e pela normalização (shared.js).
-// O payload cru do Getrak é grande demais para guardar 10k+ registros no Redis.
+// Mantém só os campos usados pela busca e pela normalização (shared.js). Usado
+// para moldar os registros AO VIVO devolvidos pela consulta por id.
 function trimVeiculo(v) {
   return {
     modulo: v.modulo ?? null,
@@ -125,13 +129,24 @@ function trimVeiculo(v) {
   };
 }
 
-// Reconstrói o snapshot a partir do provedor (operação cara: pagina toda a
-// base). É isso que o cron roda em background — nunca o usuário.
+// Entrada do índice leve: só o necessário para casar a busca (modulo/placa) e
+// resolver o id interno do Getrak usado na consulta ao vivo. SEM posição —
+// posição é sempre buscada na hora.
+function indexEntry(v) {
+  return {
+    modulo: v.modulo ?? null,
+    placa: v.placa ?? null,
+    id_veiculo: v.id_veiculo ?? null,
+  };
+}
+
+// Reconstrói o índice a partir do provedor (operação cara: pagina toda a base).
+// É isso que o cron roda em background 1x/hora — nunca o usuário.
 async function rebuildSnapshot() {
   const first = await fetchLocationsPage(1);
   const totalPages = Math.max(1, Math.ceil(first.total / PER_PAGE));
 
-  const veiculos = first.veiculos.map(trimVeiculo);
+  const veiculos = first.veiculos.map(indexEntry);
 
   if (totalPages > 1) {
     const concurrency = 5;
@@ -141,13 +156,13 @@ async function rebuildSnapshot() {
     while (remaining.length) {
       const batch = remaining.splice(0, concurrency);
       const results = await Promise.all(batch.map((p) => fetchLocationsPage(p)));
-      for (const r of results) for (const v of r.veiculos) veiculos.push(trimVeiculo(v));
+      for (const r of results) for (const v of r.veiculos) veiculos.push(indexEntry(v));
     }
   }
 
   snapshot = { veiculos, updatedAt: Date.now() };
   await writeJson(STORE_KEY, snapshot, { ttlSeconds: STORE_TTL_SECONDS });
-  console.log(`[snapshot] ${veiculos.length} veículos carregados em ${new Date().toISOString()}`);
+  console.log(`[index getrak] ${veiculos.length} equipamentos indexados em ${new Date().toISOString()}`);
   return snapshot;
 }
 
@@ -192,7 +207,7 @@ async function ensureSnapshot({ force = false, waitUntil } = {}) {
     await loadFromStore();
   }
 
-  const stale = Date.now() - snapshot.updatedAt > SNAPSHOT_TTL_MS;
+  const stale = Date.now() - snapshot.updatedAt > INDEX_TTL_MS;
   const hasData = snapshot.veiculos.length > 0;
 
   // Cache fresco — devolve direto.
@@ -226,23 +241,32 @@ function normalizeDigits(s) {
 export async function searchVehicles(query, { force = false, waitUntil } = {}) {
   await ensureSnapshot({ force, waitUntil });
   const raw = String(query ?? '').trim();
-  if (!raw) return { results: [], updatedAt: snapshot.updatedAt };
+  if (!raw) return { results: [], total: 0, updatedAt: snapshot.updatedAt };
 
   const digits = normalizeDigits(raw);
   const lowered = raw.toLowerCase();
 
-  const results = snapshot.veiculos.filter((v) => {
+  // 1) Resolve no índice leve quais equipamentos casam (por IMEI/módulo ou placa).
+  const matches = snapshot.veiculos.filter((v) => {
     const mod = normalizeDigits(v.modulo);
     if (digits && mod.includes(digits)) return true;
     if (!digits && String(v.placa ?? '').toLowerCase().includes(lowered)) return true;
     return false;
   });
 
-  return { results, updatedAt: snapshot.updatedAt };
+  // 2) Busca a posição AO VIVO só dos que casaram (limitado a MAX_LIVE pra não
+  // disparar centenas de chamadas numa busca parcial).
+  const ids = matches
+    .slice(0, MAX_LIVE)
+    .map((v) => v.id_veiculo)
+    .filter((x) => x != null && x !== '');
+  const results = await liveByIds(ids);
+
+  return { results, total: matches.length, updatedAt: snapshot.updatedAt };
 }
 
-// Consulta ao vivo os veículos cujos id_veiculo o cache já resolveu. Não toca
-// no snapshot — é só o "confirmador" pontual chamado após a busca no cache.
+// Consulta ao vivo os veículos cujos id_veiculo o índice resolveu (filtro ?id=).
+// É o que traz a posição atualizada na hora da busca.
 export async function liveByIds(ids) {
   const unique = [...new Set((ids || []).filter((x) => x != null && x !== ''))];
   if (!unique.length) return [];

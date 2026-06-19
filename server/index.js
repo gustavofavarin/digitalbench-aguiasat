@@ -9,7 +9,7 @@ import {
   preloadSnapshot as preloadDoTelematics,
 } from './dotelematics.js';
 import { detectText } from './vision.js';
-import { runSearch, runLive } from './shared.js';
+import { runSearch } from './shared.js';
 
 const app = express();
 const PORT = Number(process.env.PORT) || 3001;
@@ -53,12 +53,6 @@ app.get('/api/search', async (req, res) => {
   if (!result.ok) {
     return res.status(502).json({ error: 'Todas as fontes falharam.', warnings: result.warnings });
   }
-  res.json(result.payload);
-});
-
-app.post('/api/live', async (req, res) => {
-  const devices = req.body?.devices;
-  const result = await runLive({ devices });
   res.json(result.payload);
 });
 

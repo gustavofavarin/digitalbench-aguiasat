@@ -1,10 +1,6 @@
-import {
-  searchVehicles as searchGetrak,
-  liveByIds as liveGetrak,
-} from './getrak.js';
+import { searchVehicles as searchGetrak } from './getrak.js';
 import {
   searchVehicles as searchDoTelematics,
-  liveByDids as liveDoTelematics,
   hasCredentials as hasDoCredentials,
 } from './dotelematics.js';
 import { reverseGeocode } from './geocode.js';
@@ -70,14 +66,14 @@ export async function runSearch({ q, force, waitUntil }) {
   const settled = await Promise.allSettled(sources.map((s) => s.run()));
 
   const warnings = [];
-  const snapshotTimestamps = [];
   const merged = [];
+  let total = 0;
 
   settled.forEach((r, i) => {
     const { fonte } = sources[i];
     if (r.status === 'fulfilled') {
-      const { results, updatedAt } = r.value;
-      if (updatedAt) snapshotTimestamps.push(updatedAt);
+      const { results, total: fonteTotal } = r.value;
+      total += fonteTotal ?? results.length;
       for (const v of results) merged.push(normalizeRaw(v, fonte));
     } else {
       const msg = r.reason instanceof Error ? r.reason.message : String(r.reason);
@@ -106,64 +102,16 @@ export async function runSearch({ q, force, waitUntil }) {
     return { ...item, localizacao };
   });
 
-  const snapshotUpdatedAt = snapshotTimestamps.length
-    ? new Date(Math.max(...snapshotTimestamps)).toISOString()
-    : null;
-
   return {
     ok: true,
     payload: {
       results,
-      total: merged.length,
-      truncated: merged.length > results.length,
-      snapshotUpdatedAt,
+      total,
+      truncated: total > results.length,
+      // Os dados vêm direto do provedor (ao vivo), então o instante da busca é
+      // o momento da atualização exibido no topo.
+      snapshotUpdatedAt: new Date().toISOString(),
       warnings,
     },
   };
-}
-
-// Confirmação ao vivo, por equipamento, dos resultados que a busca no cache já
-// devolveu. Recebe os identificadores que o front já tem (idVeiculo p/ Getrak,
-// modulo/did p/ DO) e consulta direto no provedor. Falha aqui é silenciosa: é
-// só uma confirmação — o usuário continua com o dado do cache.
-export async function runLive({ devices }) {
-  const list = Array.isArray(devices) ? devices : [];
-  const getrakIds = [];
-  const doDids = [];
-  for (const d of list) {
-    if (!d) continue;
-    if (d.fonte === 'Getrak' && d.idVeiculo != null) getrakIds.push(d.idVeiculo);
-    else if (d.fonte === 'DO Telematics' && d.modulo) doDids.push(d.modulo);
-  }
-
-  const sources = [];
-  if (getrakIds.length) sources.push({ fonte: 'Getrak', run: () => liveGetrak(getrakIds) });
-  if (doDids.length && hasDoCredentials()) {
-    sources.push({ fonte: 'DO Telematics', run: () => liveDoTelematics(doDids) });
-  }
-
-  if (!sources.length) return { ok: true, payload: { results: [] } };
-
-  const settled = await Promise.allSettled(sources.map((s) => s.run()));
-
-  const merged = [];
-  settled.forEach((r, i) => {
-    const { fonte } = sources[i];
-    if (r.status === 'fulfilled') {
-      for (const v of r.value) merged.push(normalizeRaw(v, fonte));
-    } else {
-      const msg = r.reason instanceof Error ? r.reason.message : String(r.reason);
-      console.error(`[live] ${fonte} falhou:`, msg);
-    }
-  });
-
-  const results = await mapLimit(merged, GEOCODE_CONCURRENCY, async (item) => {
-    const localizacao =
-      item.lat != null && item.lon != null
-        ? await reverseGeocode(item.lat, item.lon)
-        : null;
-    return { ...item, localizacao };
-  });
-
-  return { ok: true, payload: { results } };
 }

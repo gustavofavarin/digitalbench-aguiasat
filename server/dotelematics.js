@@ -1,12 +1,15 @@
 import { readJson, writeJson, hasStore } from './store.js';
 
 const BASE_URL = 'https://api-gateway.dotelematics.com';
-const SNAPSHOT_TTL_MS = 5 * 60 * 1000;
-// Com que frequência uma instância quente relê o Redis pra adotar o snapshot
-// que o cron acabou de gravar. Tem que ser BEM menor que o intervalo do cron.
-const STORE_REVALIDATE_MS = 20 * 1000;
-const STORE_KEY = 'snapshot:dotelematics';
-const STORE_TTL_SECONDS = 30 * 60;
+// Limita o fan-out de chamadas ao vivo numa busca parcial (ver getrak.js).
+const MAX_LIVE = 50;
+// O índice (modulo/did → placa → id_veiculo) muda raríssimo. Cron reconstrói
+// 1x/hora; este TTL é só a rede de segurança pra reconstruir sob demanda.
+const INDEX_TTL_MS = 90 * 60 * 1000;
+// Com que frequência uma instância quente relê o Redis pra adotar o índice novo.
+const STORE_REVALIDATE_MS = 5 * 60 * 1000;
+const STORE_KEY = 'index:dotelematics';
+const STORE_TTL_SECONDS = 3 * 60 * 60;
 
 let tokenCache = null; // { accessToken, refreshToken, expiresAt }
 // Guarda registros já normalizados (formato getrak-like), não os docs crus —
@@ -146,14 +149,14 @@ async function fetchRealtimeByDid(did) {
   return json ? [json] : [];
 }
 
-// Reconstrói a partir do provedor (operação cara) e grava no Redis. É o que o
-// cron roda em background — nunca o usuário.
+// Reconstrói o índice leve a partir do provedor e grava no Redis. É o que o
+// cron roda em background 1x/hora — nunca o usuário.
 async function rebuildSnapshot() {
   const docs = await fetchRealtime();
-  const veiculos = docs.map(mapDocToGetrakLike);
+  const veiculos = docs.map(mapDocToIndexEntry);
   snapshot = { veiculos, updatedAt: Date.now() };
   await writeJson(STORE_KEY, snapshot, { ttlSeconds: STORE_TTL_SECONDS });
-  console.log(`[dotelematics snapshot] ${veiculos.length} trackers carregados em ${new Date().toISOString()}`);
+  console.log(`[index dotelematics] ${veiculos.length} equipamentos indexados em ${new Date().toISOString()}`);
   return snapshot;
 }
 
@@ -194,7 +197,7 @@ async function ensureSnapshot({ force = false, waitUntil } = {}) {
     await loadFromStore();
   }
 
-  const stale = Date.now() - snapshot.updatedAt > SNAPSHOT_TTL_MS;
+  const stale = Date.now() - snapshot.updatedAt > INDEX_TTL_MS;
   const hasData = snapshot.veiculos.length > 0;
 
   if (!stale && hasData) return snapshot;
@@ -239,28 +242,46 @@ function mapDocToGetrakLike(doc) {
   };
 }
 
+// Entrada do índice leve: só o necessário para casar a busca e resolver o did
+// usado na consulta ao vivo. SEM posição.
+function mapDocToIndexEntry(doc) {
+  return {
+    modulo: String(doc?.did ?? ''),
+    placa: doc?.vehicle?.plate?.trim() || null,
+    id_veiculo: doc?.vehicle?._id ?? null,
+  };
+}
+
 export async function searchVehicles(query, { force = false, waitUntil } = {}) {
   if (!hasCredentials()) {
     throw new Error('Credenciais DO Telematics ausentes');
   }
   await ensureSnapshot({ force, waitUntil });
   const raw = String(query ?? '').trim();
-  if (!raw) return { results: [], updatedAt: snapshot.updatedAt };
+  if (!raw) return { results: [], total: 0, updatedAt: snapshot.updatedAt };
 
   const digits = normalizeDigits(raw);
   const lowered = raw.toLowerCase();
 
-  const results = snapshot.veiculos.filter((v) => {
+  // 1) Resolve no índice leve quais equipamentos casam (por IMEI/did ou placa).
+  const matches = snapshot.veiculos.filter((v) => {
     const mod = normalizeDigits(v.modulo);
     if (digits) return Boolean(mod && mod.includes(digits));
     return String(v.placa ?? '').toLowerCase().includes(lowered);
   });
 
-  return { results, updatedAt: snapshot.updatedAt };
+  // 2) Busca a posição AO VIVO só dos que casaram (o did é o próprio modulo/IMEI).
+  const dids = matches
+    .slice(0, MAX_LIVE)
+    .map((v) => v.modulo)
+    .filter(Boolean);
+  const results = await liveByDids(dids);
+
+  return { results, total: matches.length, updatedAt: snapshot.updatedAt };
 }
 
-// Consulta ao vivo os devices (dids) que a busca no cache encontrou. O did é o
-// próprio modulo/IMEI, então não precisa de ponte como na Getrak.
+// Consulta ao vivo os devices (dids) que o índice resolveu. O did é o próprio
+// modulo/IMEI, então não precisa de ponte como na Getrak.
 export async function liveByDids(dids) {
   if (!hasCredentials()) throw new Error('Credenciais DO Telematics ausentes');
   const unique = [...new Set((dids || []).map((x) => String(x ?? '').trim()).filter(Boolean))];
