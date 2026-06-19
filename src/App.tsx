@@ -218,7 +218,7 @@ function App() {
     <div className="app">
       <header className="hero">
         <div className="hero-text">
-          <h1>Teste de Rastreador</h1>
+          <h1>Teste de Equipamentos</h1>
           <p>ÁguiaSat Sistemas de Rastreamento.</p>
         </div>
         <img src={logoUrl} alt="ÁguiaSat" className="hero-logo" />
