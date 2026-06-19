@@ -1,9 +1,11 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { readJson, writeJson, hasStore } from './store.js';
 
 const NOMINATIM_URL = 'https://nominatim.openstreetmap.org/reverse';
 const MIN_INTERVAL_MS = 1100;
+const GEO_TTL_SECONDS = 30 * 24 * 60 * 60; // endereços são estáveis: 30 dias
 
 // Em serverless (Vercel) o filesystem é somente leitura — desabilita persistência em disco.
 const IS_SERVERLESS = Boolean(process.env.VERCEL);
@@ -69,6 +71,17 @@ export async function reverseGeocode(lat, lon) {
   const key = cacheKey(lat, lon);
   if (cache.has(key)) return cache.get(key);
 
+  // Cache persistente (Redis): sobrevive à reciclagem da instância serverless,
+  // evitando refazer a chamada (com throttle de 1,1s) ao Nominatim a cada
+  // instância fria.
+  if (hasStore()) {
+    const stored = await readJson(`geo:${key}`);
+    if (typeof stored === 'string') {
+      cache.set(key, stored);
+      return stored;
+    }
+  }
+
   const url = new URL(NOMINATIM_URL);
   url.searchParams.set('lat', String(lat));
   url.searchParams.set('lon', String(lon));
@@ -98,6 +111,10 @@ export async function reverseGeocode(lat, lon) {
     const address = formatAddress(data);
     cache.set(key, address);
     scheduleSave();
+    // Só persiste resultados válidos (não persiste null de falha transitória).
+    if (hasStore() && typeof address === 'string') {
+      writeJson(`geo:${key}`, address, { ttlSeconds: GEO_TTL_SECONDS }).catch(() => {});
+    }
     return address;
   } catch {
     return null;

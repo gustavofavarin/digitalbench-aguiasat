@@ -1,8 +1,14 @@
+import { readJson, writeJson, hasStore } from './store.js';
+
 const BASE_URL = 'https://api-gateway.dotelematics.com';
 const SNAPSHOT_TTL_MS = 5 * 60 * 1000;
+const STORE_KEY = 'snapshot:dotelematics';
+const STORE_TTL_SECONDS = 30 * 60;
 
 let tokenCache = null; // { accessToken, refreshToken, expiresAt }
-let snapshot = { docs: [], updatedAt: 0 };
+// Guarda registros já normalizados (formato getrak-like), não os docs crus —
+// os docs do realtime são grandes demais para 10k+ rastreadores no Redis.
+let snapshot = { veiculos: [], updatedAt: 0 };
 let refreshPromise = null;
 
 function getEnv(name) {
@@ -123,44 +129,71 @@ async function fetchRealtime() {
   return Array.isArray(json) ? json : [];
 }
 
-async function refreshSnapshot() {
+// Reconstrói a partir do provedor (operação cara) e grava no Redis. É o que o
+// cron roda em background — nunca o usuário.
+async function rebuildSnapshot() {
   const docs = await fetchRealtime();
-  snapshot = { docs, updatedAt: Date.now() };
-  console.log(`[dotelematics snapshot] ${docs.length} trackers carregados em ${new Date().toISOString()}`);
+  const veiculos = docs.map(mapDocToGetrakLike);
+  snapshot = { veiculos, updatedAt: Date.now() };
+  await writeJson(STORE_KEY, snapshot, { ttlSeconds: STORE_TTL_SECONDS });
+  console.log(`[dotelematics snapshot] ${veiculos.length} trackers carregados em ${new Date().toISOString()}`);
   return snapshot;
 }
 
+async function loadFromStore() {
+  const stored = await readJson(STORE_KEY);
+  if (stored && Array.isArray(stored.veiculos) && stored.updatedAt > snapshot.updatedAt) {
+    snapshot = stored;
+  }
+  return snapshot;
+}
+
+function startBackgroundRebuild(waitUntil) {
+  if (!refreshPromise) {
+    refreshPromise = rebuildSnapshot()
+      .catch((err) => console.error('[dotelematics bg refresh] erro:', err.message))
+      .finally(() => {
+        refreshPromise = null;
+      });
+  }
+  if (typeof waitUntil === 'function') waitUntil(refreshPromise);
+  return refreshPromise;
+}
+
 async function ensureSnapshot({ force = false, waitUntil } = {}) {
+  if (force) {
+    if (refreshPromise) return refreshPromise;
+    refreshPromise = rebuildSnapshot().finally(() => {
+      refreshPromise = null;
+    });
+    return refreshPromise;
+  }
+
+  if (hasStore() && Date.now() - snapshot.updatedAt > SNAPSHOT_TTL_MS) {
+    await loadFromStore();
+  }
+
   const stale = Date.now() - snapshot.updatedAt > SNAPSHOT_TTL_MS;
-  const hasData = snapshot.docs.length > 0;
+  const hasData = snapshot.veiculos.length > 0;
 
-  // Cache fresco — devolve direto.
-  if (!force && !stale && hasData) return snapshot;
+  if (!stale && hasData) return snapshot;
 
-  // Stale-while-revalidate: tem dados velhos, devolve eles agora e
-  // atualiza em background. Próxima busca já vai pegar fresco.
-  // No Vercel, sem waitUntil, o lambda congela após o response e o
-  // refresh nunca completa — snapshot ficaria travado pra sempre.
-  if (!force && stale && hasData) {
-    if (!refreshPromise) {
-      refreshPromise = refreshSnapshot()
-        .catch((err) =>
-          console.error('[dotelematics bg refresh] erro:', err.message),
-        )
-        .finally(() => {
-          refreshPromise = null;
-        });
-      if (typeof waitUntil === 'function') waitUntil(refreshPromise);
-    }
+  if (stale && hasData) {
+    startBackgroundRebuild(waitUntil);
     return snapshot;
   }
 
-  // Vazio ou force — precisa esperar a primeira carga.
   if (refreshPromise) return refreshPromise;
-  refreshPromise = refreshSnapshot().finally(() => {
+  refreshPromise = rebuildSnapshot().finally(() => {
     refreshPromise = null;
   });
   return refreshPromise;
+}
+
+// Usado pelo cron.
+export async function rebuildAndStore() {
+  if (!hasCredentials()) return null;
+  return rebuildSnapshot();
 }
 
 function normalizeDigits(s) {
@@ -196,24 +229,17 @@ export async function searchVehicles(query, { force = false, waitUntil } = {}) {
   const digits = normalizeDigits(raw);
   const lowered = raw.toLowerCase();
 
-  const results = [];
-  for (const doc of snapshot.docs) {
-    const did = String(doc?.did ?? '');
-    const plate = String(doc?.vehicle?.plate ?? '').toLowerCase();
-    let match = false;
-    if (digits) {
-      if (did && did.includes(digits)) match = true;
-    } else if (plate && plate.includes(lowered)) {
-      match = true;
-    }
-    if (match) results.push(mapDocToGetrakLike(doc));
-  }
+  const results = snapshot.veiculos.filter((v) => {
+    const mod = normalizeDigits(v.modulo);
+    if (digits) return Boolean(mod && mod.includes(digits));
+    return String(v.placa ?? '').toLowerCase().includes(lowered);
+  });
 
   return { results, updatedAt: snapshot.updatedAt };
 }
 
 export function getSnapshotInfo() {
-  return { total: snapshot.docs.length, updatedAt: snapshot.updatedAt };
+  return { total: snapshot.veiculos.length, updatedAt: snapshot.updatedAt };
 }
 
 export async function preloadSnapshot() {

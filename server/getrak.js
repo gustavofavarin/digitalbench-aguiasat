@@ -1,7 +1,14 @@
+import { readJson, writeJson, hasStore } from './store.js';
+
 const TOKEN_URL = 'https://api.getrak.com/newkoauth/oauth/token';
 const LOCATIONS_URL = 'https://api.getrak.com/v0.1/localizacoes';
 const PER_PAGE = 500;
 const SNAPSHOT_TTL_MS = 5 * 60 * 1000;
+const STORE_KEY = 'snapshot:getrak';
+// O snapshot fica no Redis com TTL maior que o do cron; assim, se o cron
+// falhar por um ciclo, a busca ainda encontra dados (stale) em vez de ter
+// que reconstruir do provedor no caminho do usuário.
+const STORE_TTL_SECONDS = 30 * 60;
 
 let tokenCache = null;
 let snapshot = { veiculos: [], updatedAt: 0 };
@@ -83,11 +90,28 @@ async function fetchLocationsPage(page) {
   };
 }
 
-async function refreshSnapshot() {
+// Mantém só os campos usados pela busca e pela normalização (shared.js).
+// O payload cru do Getrak é grande demais para guardar 10k+ registros no Redis.
+function trimVeiculo(v) {
+  return {
+    modulo: v.modulo ?? null,
+    placa: v.placa ?? null,
+    id_veiculo: v.id_veiculo ?? null,
+    datastatus: v.datastatus ?? null,
+    data: v.data ?? null,
+    tensao_bateria: v.tensao_bateria ?? null,
+    lat: v.lat ?? null,
+    lon: v.lon ?? null,
+  };
+}
+
+// Reconstrói o snapshot a partir do provedor (operação cara: pagina toda a
+// base). É isso que o cron roda em background — nunca o usuário.
+async function rebuildSnapshot() {
   const first = await fetchLocationsPage(1);
   const totalPages = Math.max(1, Math.ceil(first.total / PER_PAGE));
 
-  const veiculos = [...first.veiculos];
+  const veiculos = first.veiculos.map(trimVeiculo);
 
   if (totalPages > 1) {
     const concurrency = 5;
@@ -97,44 +121,78 @@ async function refreshSnapshot() {
     while (remaining.length) {
       const batch = remaining.splice(0, concurrency);
       const results = await Promise.all(batch.map((p) => fetchLocationsPage(p)));
-      for (const r of results) veiculos.push(...r.veiculos);
+      for (const r of results) for (const v of r.veiculos) veiculos.push(trimVeiculo(v));
     }
   }
 
   snapshot = { veiculos, updatedAt: Date.now() };
+  await writeJson(STORE_KEY, snapshot, { ttlSeconds: STORE_TTL_SECONDS });
   console.log(`[snapshot] ${veiculos.length} veículos carregados em ${new Date().toISOString()}`);
   return snapshot;
 }
 
+// Adota no processo o snapshot que está no Redis, se for mais novo que o
+// que temos em memória. Leitura rápida (~ms) — é o que substitui a
+// reconstrução de 15s quando a instância acorda fria.
+async function loadFromStore() {
+  const stored = await readJson(STORE_KEY);
+  if (stored && Array.isArray(stored.veiculos) && stored.updatedAt > snapshot.updatedAt) {
+    snapshot = stored;
+  }
+  return snapshot;
+}
+
+function startBackgroundRebuild(waitUntil) {
+  if (!refreshPromise) {
+    refreshPromise = rebuildSnapshot()
+      .catch((err) => console.error('[snapshot bg refresh] erro:', err.message))
+      .finally(() => {
+        refreshPromise = null;
+      });
+  }
+  if (typeof waitUntil === 'function') waitUntil(refreshPromise);
+  return refreshPromise;
+}
+
 async function ensureSnapshot({ force = false, waitUntil } = {}) {
+  if (force) {
+    if (refreshPromise) return refreshPromise;
+    refreshPromise = rebuildSnapshot().finally(() => {
+      refreshPromise = null;
+    });
+    return refreshPromise;
+  }
+
+  // Memória fria/velha? Tenta o Redis primeiro (leitura barata).
+  if (hasStore() && Date.now() - snapshot.updatedAt > SNAPSHOT_TTL_MS) {
+    await loadFromStore();
+  }
+
   const stale = Date.now() - snapshot.updatedAt > SNAPSHOT_TTL_MS;
   const hasData = snapshot.veiculos.length > 0;
 
   // Cache fresco — devolve direto.
-  if (!force && !stale && hasData) return snapshot;
+  if (!stale && hasData) return snapshot;
 
-  // Stale-while-revalidate: tem dados velhos, devolve eles agora e
-  // atualiza em background. Próxima busca já vai pegar fresco.
-  // No Vercel, sem waitUntil, o lambda congela após o response e o
-  // refresh nunca completa — snapshot ficaria travado pra sempre.
-  if (!force && stale && hasData) {
-    if (!refreshPromise) {
-      refreshPromise = refreshSnapshot()
-        .catch((err) => console.error('[snapshot bg refresh] erro:', err.message))
-        .finally(() => {
-          refreshPromise = null;
-        });
-      if (typeof waitUntil === 'function') waitUntil(refreshPromise);
-    }
+  // Stale-while-revalidate: tem dados (velhos) — devolve já e atualiza em
+  // background. O cron é o caminho principal de atualização; isto é só uma
+  // rede de segurança caso o cron falhe.
+  if (stale && hasData) {
+    startBackgroundRebuild(waitUntil);
     return snapshot;
   }
 
-  // Vazio ou force — precisa esperar a primeira carga.
+  // Não há nada em lugar nenhum (bootstrap) — precisa esperar a 1ª carga.
   if (refreshPromise) return refreshPromise;
-  refreshPromise = refreshSnapshot().finally(() => {
+  refreshPromise = rebuildSnapshot().finally(() => {
     refreshPromise = null;
   });
   return refreshPromise;
+}
+
+// Usado pelo cron: força a reconstrução a partir do provedor e grava no Redis.
+export async function rebuildAndStore() {
+  return rebuildSnapshot();
 }
 
 function normalizeDigits(s) {
