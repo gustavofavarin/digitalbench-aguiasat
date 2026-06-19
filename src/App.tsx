@@ -418,7 +418,6 @@ function App() {
       {!loading && !error && !data && searched === false && (
         <p className="hint">Digite o ID/IMEI (ou os últimos dígitos) e clique em Buscar.</p>
       )}
-      <footer className="app-version">version 1.0</footer>
       <Analytics />
     </div>
   )
