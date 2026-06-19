@@ -4,6 +4,11 @@ const TOKEN_URL = 'https://api.getrak.com/newkoauth/oauth/token';
 const LOCATIONS_URL = 'https://api.getrak.com/v0.1/localizacoes';
 const PER_PAGE = 500;
 const SNAPSHOT_TTL_MS = 5 * 60 * 1000;
+// Com que frequência uma instância quente reler o Redis pra adotar o snapshot
+// que o cron acabou de gravar. Tem que ser BEM menor que o intervalo do cron,
+// senão a instância serve a foto velha da memória por muito tempo. NÃO usar
+// SNAPSHOT_TTL_MS pra isso: aquele TTL é só pra decidir reconstruir do provedor.
+const STORE_REVALIDATE_MS = 20 * 1000;
 const STORE_KEY = 'snapshot:getrak';
 // O snapshot fica no Redis com TTL maior que o do cron; assim, se o cron
 // falhar por um ciclo, a busca ainda encontra dados (stale) em vez de ter
@@ -12,6 +17,7 @@ const STORE_TTL_SECONDS = 30 * 60;
 
 let tokenCache = null;
 let snapshot = { veiculos: [], updatedAt: 0 };
+let lastStoreCheck = 0; // quando lemos o Redis pela última vez (throttle)
 let refreshPromise = null;
 
 
@@ -163,8 +169,12 @@ async function ensureSnapshot({ force = false, waitUntil } = {}) {
     return refreshPromise;
   }
 
-  // Memória fria/velha? Tenta o Redis primeiro (leitura barata).
-  if (hasStore() && Date.now() - snapshot.updatedAt > SNAPSHOT_TTL_MS) {
+  // Revalida a partir do Redis no máx. uma vez a cada STORE_REVALIDATE_MS.
+  // O cron mantém o Redis fresco; aqui só adotamos esse dado novo (leitura
+  // barata) em vez de servir a cópia da memória por 5 min. Marcamos o horário
+  // ANTES do await pra não martelar o Redis a cada busca.
+  if (hasStore() && Date.now() - lastStoreCheck > STORE_REVALIDATE_MS) {
+    lastStoreCheck = Date.now();
     await loadFromStore();
   }
 

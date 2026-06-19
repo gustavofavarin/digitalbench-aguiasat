@@ -2,6 +2,9 @@ import { readJson, writeJson, hasStore } from './store.js';
 
 const BASE_URL = 'https://api-gateway.dotelematics.com';
 const SNAPSHOT_TTL_MS = 5 * 60 * 1000;
+// Com que frequência uma instância quente relê o Redis pra adotar o snapshot
+// que o cron acabou de gravar. Tem que ser BEM menor que o intervalo do cron.
+const STORE_REVALIDATE_MS = 20 * 1000;
 const STORE_KEY = 'snapshot:dotelematics';
 const STORE_TTL_SECONDS = 30 * 60;
 
@@ -9,6 +12,7 @@ let tokenCache = null; // { accessToken, refreshToken, expiresAt }
 // Guarda registros já normalizados (formato getrak-like), não os docs crus —
 // os docs do realtime são grandes demais para 10k+ rastreadores no Redis.
 let snapshot = { veiculos: [], updatedAt: 0 };
+let lastStoreCheck = 0; // quando lemos o Redis pela última vez (throttle)
 let refreshPromise = null;
 
 function getEnv(name) {
@@ -169,7 +173,11 @@ async function ensureSnapshot({ force = false, waitUntil } = {}) {
     return refreshPromise;
   }
 
-  if (hasStore() && Date.now() - snapshot.updatedAt > SNAPSHOT_TTL_MS) {
+  // Revalida a partir do Redis no máx. uma vez a cada STORE_REVALIDATE_MS, em
+  // vez de servir a cópia da memória por 5 min. Marca o horário ANTES do await
+  // pra não martelar o Redis a cada busca.
+  if (hasStore() && Date.now() - lastStoreCheck > STORE_REVALIDATE_MS) {
+    lastStoreCheck = Date.now();
     await loadFromStore();
   }
 
